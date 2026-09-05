@@ -197,67 +197,76 @@ class MergeEngine:
         return [b for b in branches if b != self.main_branch]
 
     def analyze_branch(self, branch: str) -> BranchAnalysis:
-        """Analyze a branch for beneficial elements."""
-        # Get ahead/behind counts
-        ahead_behind = self._git(
-            "rev-list", "--left-right", "--count",
-            f"{self.main_branch}...{branch}"
-        )
-        parts = ahead_behind.split()
-        behind = int(parts[0]) if len(parts) > 0 else 0
-        ahead = int(parts[1]) if len(parts) > 1 else 0
-
-        # Get commits
-        commits = []
-        if ahead > 0:
-            commit_output = self._git(
-                "log", f"{self.main_branch}..{branch}",
-                "--format=%H|%s|%an|%ai", "-n", "20"
+        """Analyze a branch for beneficial elements.
+        
+        Raises:
+            ValueError: If branch doesn't exist or analysis fails.
+        """
+        try:
+            # Get ahead/behind counts
+            ahead_behind = self._git(
+                "rev-list", "--left-right", "--count",
+                f"{self.main_branch}...{branch}"
             )
-            for line in commit_output.split("\n"):
-                if "|" in line:
-                    parts = line.split("|", 3)
-                    commits.append({
-                        "hash": parts[0],
-                        "message": parts[1],
-                        "author": parts[2],
-                        "date": parts[3] if len(parts) > 3 else "",
-                    })
+            parts = ahead_behind.split()
+            behind = int(parts[0]) if len(parts) > 0 else 0
+            ahead = int(parts[1]) if len(parts) > 1 else 0
 
-        # Get files changed
-        files_output = self._git(
-            "diff", f"{self.main_branch}...{branch}",
-            "--name-only"
-        )
-        files_changed = [f.strip() for f in files_output.split("\n") if f.strip()]
+            # Get commits
+            commits = []
+            if ahead > 0:
+                commit_output = self._git(
+                    "log", f"{self.main_branch}..{branch}",
+                    "--format=%H|%s|%an|%ai", "-n", "20"
+                )
+                for line in commit_output.split("\n"):
+                    if "|" in line:
+                        parts = line.split("|", 3)
+                        commits.append({
+                            "hash": parts[0],
+                            "message": parts[1],
+                            "author": parts[2],
+                            "date": parts[3] if len(parts) > 3 else "",
+                        })
 
-        # Get diff hunks
-        hunks = self._get_hunks(branch)
+            # Get files changed
+            files_output = self._git(
+                "diff", f"{self.main_branch}...{branch}",
+                "--name-only"
+            )
+            files_changed = [f.strip() for f in files_output.split("\n") if f.strip()]
 
-        # Score the branch
-        score = self._score_branch(ahead, behind, commits, files_changed, hunks)
-        beneficial = score > 0
+            # Get diff hunks
+            hunks = self._get_hunks(branch)
 
-        reason = ""
-        if not beneficial:
-            if ahead == 0:
-                reason = "No new commits"
-            elif len(files_changed) == 0:
-                reason = "No files changed"
-            elif score <= 0:
-                reason = "No beneficial additions detected"
+            # Score the branch
+            score = self._score_branch(ahead, behind, commits, files_changed, hunks)
+            beneficial = score > 0
 
-        return BranchAnalysis(
-            name=branch,
-            ahead=ahead,
-            behind=behind,
-            commits=commits,
-            files_changed=files_changed,
-            hunks=hunks,
-            beneficial=beneficial,
-            reason=reason,
-            score=score,
-        )
+            reason = ""
+            if not beneficial:
+                if ahead == 0:
+                    reason = "No new commits"
+                elif len(files_changed) == 0:
+                    reason = "No files changed"
+                elif score <= 0:
+                    reason = "No beneficial additions detected"
+
+            return BranchAnalysis(
+                name=branch,
+                ahead=ahead,
+                behind=behind,
+                commits=commits,
+                files_changed=files_changed,
+                hunks=hunks,
+                beneficial=beneficial,
+                reason=reason,
+                score=score,
+            )
+        except subprocess.TimeoutExpired:
+            raise ValueError(f"Analysis timed out for branch {branch}")
+        except Exception as e:
+            raise ValueError(f"Failed to analyze branch {branch}: {e}") from e
 
     def _get_hunks(self, branch: str) -> List[DiffHunk]:
         """Get diff hunks from a branch."""
@@ -313,45 +322,70 @@ class MergeEngine:
     def _score_branch(self, ahead: int, behind: int,
                       commits: List[Dict], files: List[str],
                       hunks: List[DiffHunk]) -> float:
-        """Score a branch's beneficial value."""
+        """Score a branch's beneficial value with smart heuristics.
+        
+        Considers:
+        - Commit count and quality
+        - File diversity and new files
+        - Code additions vs deletions ratio
+        - Branch divergence penalty
+        - Evidence of testing (test files)
+        """
         if ahead == 0:
             return 0.0
 
-        # Base score from commits
+        # Base score from commits (diminishing returns after 10)
         commit_score = min(1.0, ahead / 10)
 
-        # File diversity bonus
+        # File diversity bonus (more files = more impact)
         file_score = min(1.0, len(files) / 5)
 
         # Code quality heuristic
         total_additions = sum(h.additions for h in hunks)
         total_deletions = sum(h.deletions for h in hunks)
 
-        # Positive additions
+        # Positive additions (diminishing returns after 100 lines)
         if total_additions > 0:
             add_score = min(1.0, total_additions / 100)
         else:
             add_score = 0.0
 
-        # Deletions can be beneficial (cleanup)
-        if total_deletions > 0 and total_deletions < total_addions:
-            del_score = 0.3
+        # Deletions can be beneficial (cleanup) but not if too many
+        if total_deletions > 0 and total_deletions < total_additions:
+            del_score = 0.3 * (1 - total_deletions / max(total_additions, 1))
         else:
             del_score = 0.0
 
-        # New files bonus
+        # New files bonus (more new files = more innovation)
         new_files = len([h for h in hunks if h.additions > 0 and h.deletions == 0])
         new_file_score = min(0.5, new_files / 3)
 
+        # Test file bonus (tests are valuable)
+        test_files = len([f for f in files if "test" in f.lower() or f.endswith("_test.py")])
+        test_score = min(0.3, test_files / 3)
+
         # Penalize if behind (diverged)
-        if behind > 5:
+        if behind > 10:
+            behind_penalty = -0.5
+        elif behind > 5:
             behind_penalty = -0.3
         elif behind > 0:
             behind_penalty = -0.1
         else:
             behind_penalty = 0.0
 
-        total = commit_score + file_score + add_score + del_score + new_file_score + behind_penalty
+        # Bonus for balanced additions/deletions (healthy refactoring)
+        if total_additions > 0 and total_deletions > 0:
+            ratio = total_deletions / total_additions
+            if 0.2 <= ratio <= 0.8:
+                balance_bonus = 0.2
+            else:
+                balance_bonus = 0.0
+        else:
+            balance_bonus = 0.0
+
+        total = (commit_score + file_score + add_score + del_score +
+                 new_file_score + test_score + behind_penalty + balance_bonus)
         return max(0.0, min(1.0, total))
 
     def transcribe(self, analysis: BranchAnalysis, dry_run: bool = False) -> TranscribeResult:
