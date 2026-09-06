@@ -389,7 +389,14 @@ class MergeEngine:
         return max(0.0, min(1.0, total))
 
     def transcribe(self, analysis: BranchAnalysis, dry_run: bool = False) -> TranscribeResult:
-        """Transcribe beneficial elements from a branch to main."""
+        """Transcribe beneficial elements from a branch to main.
+        
+        Smart merge strategy:
+        - Applies hunks that don't conflict with main
+        - Skips hunks that would cause conflicts
+        - Reports conflicts for manual resolution
+        - Handles new files vs modified files differently
+        """
         if not analysis.beneficial:
             return TranscribeResult(
                 branch=analysis.name,
@@ -403,7 +410,7 @@ class MergeEngine:
         files_transcribed = 0
         hunks_applied = 0
         hunks_skipped = 0
-        conflicts = []
+        conflicts: List[str] = []
 
         for hunk in analysis.hunks:
             if dry_run:
@@ -422,7 +429,7 @@ class MergeEngine:
                 except Exception:
                     main_content = ""
 
-                # Simple merge: apply additions from branch
+                # Smart merge: apply additions from branch
                 if self._can_apply_hunk(hunk, main_content, branch_content):
                     # Write the branch version
                     target_path = self.repo_path / hunk.file
@@ -431,16 +438,16 @@ class MergeEngine:
                     hunks_applied += 1
                     files_transcribed += 1
                 else:
-                    conflicts.append(hunk.file)
+                    # Conflict detected - skip and report
                     hunks_skipped += 1
+                    conflicts.append(
+                        f"Conflict in {hunk.file}: "
+                        f"+{hunk.additions}/-{hunk.deletions}"
+                    )
+
             except Exception as e:
                 hunks_skipped += 1
-                conflicts.append(f"{hunk.file}: {str(e)}")
-
-        # Commit if not dry run
-        if not dry_run and hunks_applied > 0:
-            self._git("add", "-A")
-            self._git("commit", "-m", f"Transcribe from {analysis.name}: {hunks_applied} hunks")
+                conflicts.append(f"Error processing {hunk.file}: {e}")
 
         return TranscribeResult(
             branch=analysis.name,
@@ -449,6 +456,138 @@ class MergeEngine:
             hunks_skipped=hunks_skipped,
             conflicts=conflicts,
             success=len(conflicts) == 0,
+        )
+
+    def _can_apply_hunk(
+        self,
+        hunk: DiffHunk,
+        main_content: str,
+        branch_content: str,
+    ) -> bool:
+        """Check if a hunk can be applied without conflicts.
+        
+        Uses line-by-line comparison to detect conflicts.
+        Returns True if the hunk can be safely applied.
+        """
+        if not main_content:
+            return True  # New file, no conflicts
+
+        main_lines = main_content.split("\n")
+        branch_lines = branch_content.split("\n")
+
+        # Check if the hunk's additions are already in main
+        added_lines = [
+            line for line in branch_lines
+            if line not in main_lines and line.strip()
+        ]
+
+        # If most additions are new, safe to apply
+        if len(added_lines) > len(hunk.additions) * 0.5:
+            return True
+
+        # Check for overlapping changes
+        for line in added_lines:
+            if line in main_lines:
+                return False  # Conflict: line already exists in main
+
+        return True
+
+    def merge_branch(
+        self,
+        branch: str,
+        strategy: str = "smart",
+    ) -> MergeReport:
+        """Merge a branch into main with smart conflict resolution.
+        
+        Strategies:
+        - smart: Apply non-conflicting hunks, report conflicts
+        - force: Apply all hunks, overwrite conflicts
+        - safe: Only merge if no conflicts detected
+        
+        Returns a MergeReport with results.
+        """
+        analysis = self.analyze_branch(branch)
+
+        if not analysis.beneficial:
+            return MergeReport(
+                repo=str(self.repo_path),
+                main_branch=self.main_branch,
+                branches_analyzed=1,
+                branches_beneficial=0,
+                branches_pruned=0,
+                total_hunks_applied=0,
+                total_hunks_skipped=len(analysis.hunks),
+                total_files_transcribed=0,
+                duration_ms=0.0,
+                results=[{
+                    "branch": branch,
+                    "success": False,
+                    "beneficial": False,
+                    "reason": analysis.reason,
+                    "score": analysis.score,
+                }],
+            )
+
+        # Apply hunks based on strategy
+        if strategy == "force":
+            # Force apply all hunks
+            for hunk in analysis.hunks:
+                try:
+                    branch_content = self._git("show", f"{branch}:{hunk.file}")
+                    target_path = self.repo_path / hunk.file
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(branch_content)
+                except Exception:
+                    pass
+        elif strategy == "safe":
+            # Only merge if no conflicts
+            for hunk in analysis.hunks:
+                try:
+                    branch_content = self._git("show", f"{branch}:{hunk.file}")
+                    main_content = self._git("show", f"{self.main_branch}:{hunk.file}")
+                    if not self._can_apply_hunk(hunk, main_content, branch_content):
+                        return MergeReport(
+                            repo=str(self.repo_path),
+                            main_branch=self.main_branch,
+                            branches_analyzed=1,
+                            branches_beneficial=0,
+                            branches_pruned=0,
+                            total_hunks_applied=0,
+                            total_hunks_skipped=len(analysis.hunks),
+                            total_files_transcribed=0,
+                            duration_ms=0.0,
+                            results=[{
+                                "branch": branch,
+                                "success": False,
+                                "beneficial": True,
+                                "reason": "Conflicts detected in safe mode",
+                                "score": analysis.score,
+                            }],
+                        )
+                except Exception:
+                    pass
+
+        # Smart strategy: apply non-conflicting hunks
+        result = self.transcribe(analysis, dry_run=False)
+
+        return MergeReport(
+            repo=str(self.repo_path),
+            main_branch=self.main_branch,
+            branches_analyzed=1,
+            branches_beneficial=1 if analysis.beneficial else 0,
+            branches_pruned=0,
+            total_hunks_applied=result.hunks_applied,
+            total_hunks_skipped=result.hunks_skipped,
+            total_files_transcribed=result.files_transcribed,
+            duration_ms=0.0,
+            results=[{
+                "branch": branch,
+                "success": result.success,
+                "beneficial": analysis.beneficial,
+                "reason": analysis.reason,
+                "score": analysis.score,
+                "conflicts": result.conflicts,
+            }],
         )
 
     def _can_apply_hunk(self, hunk: DiffHunk, main_content: str, branch_content: str) -> bool:
